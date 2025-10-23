@@ -1,0 +1,180 @@
+name: "RDP via Tailscale (A → B, Win2025, fixed hostname, purge prefix, keepalive)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      ts_tailnet:        { description: "Tailscale tailnet (e.g. you@gmail.com)", required: true }
+      ts_api_key:        { description: "Tailscale API key (device admin, key only)", required: true }
+      ts_authkey:        { description: "Tailscale Auth key (reusable/ephemeral)", required: true }
+      runtime_minutes:   { description: "Session length (6–355, default 355). Ignored if quick_test=true", required: false, default: "355" }
+      quick_test:
+        description: "Run 5-minute test"
+        required: false
+        default: false
+        type: boolean
+      cycles:            { description: "0=infinite; N=handoffs left incl. this run", required: false, default: "0" }
+      hostname_prefix:   { description: "Hostname prefix to enforce", required: false, default: "bullet" }
+      do_purge:
+        description: "Purge devices named <prefix> or <prefix>-N at start & end"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: tailscale-rdp-singleton
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  rdp:
+    runs-on: windows-2025
+    timeout-minutes: 370
+    env:
+      RDP_USER: Bullettemporary
+      RDP_PASS: Bullet@12345
+
+    steps:
+      - name: Setup & Run (A)
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # ----- Helpers -----
+          function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
+          function IntOr($v,$def){
+            $s = ("" + $v).Trim()
+            if($s -match '^\d+$'){ return [int]$s } else { return [int]$def }
+          }
+
+          # ----- Inputs -----
+          $tailnet = "${{ inputs.ts_tailnet }}"
+          $apiKey  = "${{ inputs.ts_api_key }}"
+          $authKey = "${{ inputs.ts_authkey }}"
+          $rtInReq = IntOr("${{ inputs.runtime_minutes }}",355)
+          $quick   = Yes("${{ inputs.quick_test }}")
+          $cyclesIn= IntOr("${{ inputs.cycles }}",0)
+          $prefix  = "${{ inputs.hostname_prefix }}"
+          if([string]::IsNullOrWhiteSpace($prefix)){ $prefix = "bullet" }
+          $doPurge = Yes("${{ inputs.do_purge }}")
+
+          # ----- Runtime policy -----
+          if ($quick) {
+            $runtime = 5
+          } else {
+            $rt = $rtInReq
+            if ($rt -lt 6) { $rt = 355 }
+            if ($rt -gt 355) { $rt = 355 }
+            $runtime = $rt
+          }
+          $desiredHostname = $prefix
+          Write-Host "Resolved runtime: $runtime min (quick_test=$quick, requested=${rtInReq}); prefix=$prefix; cycles_in=$cyclesIn; purge=$doPurge"
+
+          # ----- Tailscale API helpers -----
+          function Get-TsHeader([string]$Key){
+            $basic = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${Key}:"))
+            return @{ Authorization = "Basic $basic"; Accept = "application/json" }
+          }
+          function Get-Devices($Hdr,$Tailnet){
+            $url = "https://api.tailscale.com/api/v2/tailnet/$([uri]::EscapeDataString($Tailnet))/devices"
+            Invoke-RestMethod -Method GET -Headers $Hdr -Uri $url -UseBasicParsing
+          }
+          function Purge-Prefix($Hdr,$Tailnet,$Prefix,$KeepId){
+            if(-not $doPurge){ return }
+            $rx = '^(?i)' + [regex]::Escape($Prefix) + '(-\d+)?$'
+            try { $resp = Get-Devices $Hdr $Tailnet } catch { Write-Host "List error: $($_.Exception.Message)"; return }
+            foreach($d in $resp.devices){
+              if($KeepId -and $d.id -eq $KeepId){ continue }
+              if($d.name -match $rx -or $d.hostname -match $rx){
+                $delUrl = "https://api.tailscale.com/api/v2/device/$($d.id)"
+                try { Invoke-RestMethod -Method DELETE -Headers $Hdr -Uri $delUrl -UseBasicParsing | Out-Null; Write-Host "Purged: $($d.name) ($($d.id))" }
+                catch {
+                  $code = $_.Exception.Response.StatusCode.Value__ 2>$null
+                  if($code -eq 404){ Write-Host "Already gone: $($d.name)" } else { Write-Host "Delete error $($d.name): $($_.Exception.Message)" }
+                }
+              }
+            }
+          }
+
+          $hdr = Get-TsHeader $apiKey
+
+          # ----- Purge BEFORE start -----
+          Purge-Prefix $hdr $tailnet $prefix ""
+
+          # ----- Install Tailscale if needed -----
+          $exe = "C:\Program Files\Tailscale\tailscale.exe"
+          if (-not (Test-Path $exe)) {
+            $dst = "$env:TEMP\tailscale-setup.exe"
+            Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe' -OutFile $dst -UseBasicParsing
+            Start-Process -FilePath $dst -ArgumentList "/quiet" -Wait
+          }
+          Start-Service Tailscale -ErrorAction SilentlyContinue
+
+          # ----- Enable RDP -----
+          $u="${env:RDP_USER}"; $p="${env:RDP_PASS}"
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember -Group Administrators -Member $u
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          } else {
+            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Enable-LocalUser -Name $u
+          }
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+
+          # ----- Join Tailscale -----
+          & $exe logout | Out-Null
+          & $exe up --authkey "$authKey" --hostname "$desiredHostname" --accept-routes --accept-dns=false
+          Start-Sleep -Seconds 2
+
+          # Keep only this runner for the prefix
+          $ip4 = (& $exe ip -4 | Select-Object -First 1)
+          $resp = Get-Devices $hdr $tailnet
+          $self = $resp.devices | Where-Object { $_.addresses -contains $ip4 }
+          $keepId = if($self){ $self.id } else { "" }
+          Purge-Prefix $hdr $tailnet $prefix $keepId
+
+          Write-Host "RDP ready: IP=$ip4, hostname=$desiredHostname"
+
+          # ----- Keepalive -----
+          $end=(Get-Date).AddMinutes($runtime)
+          while((Get-Date) -lt $end){
+            $left=[int]([math]::Ceiling(($end-(Get-Date)).TotalMinutes))
+            Write-Host "Alive... ($left min left)"
+            Start-Sleep -Seconds 60
+          }
+
+          # ----- Purge AFTER end -----
+          Purge-Prefix $hdr $tailnet $prefix ""
+
+      - name: Dispatch B (respect cycles)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $cyclesIn = [int]"${{ inputs.cycles }}"
+          if ($cyclesIn -gt 0) { $next = $cyclesIn - 1 } else { $next = 0 }
+          if ($cyclesIn -eq 1) { Write-Host "Cycles exhausted after A — stopping."; exit 0 }
+
+          $payload = @{
+            ts_tailnet      = "${{ inputs.ts_tailnet }}"
+            ts_api_key      = "${{ inputs.ts_api_key }}"
+            ts_authkey      = "${{ inputs.ts_authkey }}"
+            runtime_minutes = "${{ inputs.runtime_minutes }}"
+            quick_test      = "${{ inputs.quick_test }}"
+            cycles          = "$next"
+            hostname_prefix = "${{ inputs.hostname_prefix }}"
+            do_purge        = "${{ inputs.do_purge }}"
+          }
+          $url  = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-B.yml/dispatches"
+          $hdr  = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+          $body = @{ ref = "${{ github.ref_name }}"; inputs = $payload } | ConvertTo-Json -Depth 8
+          Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body -UseBasicParsing | Out-Null
+          Write-Host "Dispatched Workflow B with cycles=$next"
